@@ -1,0 +1,94 @@
+{
+  "tests": [
+    {
+      "name": "folkrace_driver.py eksisteerib",
+      "setup": "",
+      "run": "python3 -c \"import glob, sys; files=[f for f in glob.glob('**/folkrace_driver.py', recursive=True) if not f.startswith('.github')]; sys.exit(0 if files else 1)\"",
+      "input": "",
+      "output": "",
+      "comparison": "included",
+      "timeout": 5,
+      "points": 5
+    },
+    {
+      "name": "Python suuntaks on korrektne",
+      "setup": "",
+      "run": "python3 -c \"import glob, ast, sys; files=[f for f in glob.glob('**/folkrace_driver.py', recursive=True) if not f.startswith('.github')]; sys.exit(1) if not files else ast.parse(open(files[0]).read())\"",
+      "input": "",
+      "output": "",
+      "comparison": "included",
+      "timeout": 5,
+      "points": 10
+    },
+    {
+      "name": "Impordid on olemas (LaserScan, Twist)",
+      "setup": "",
+      "run": "python3 -c \"import glob, sys; files=[f for f in glob.glob('**/folkrace_driver.py', recursive=True) if not f.startswith('.github')]; sys.exit(1) if not files else None; code=open(files[0]).read(); sys.exit(0 if 'LaserScan' in code and 'Twist' in code else 1)\"",
+      "input": "",
+      "output": "",
+      "comparison": "included",
+      "timeout": 5,
+      "points": 5
+    },
+    {
+      "name": "Lidar lugemine implementeeritud (front ei ole 8.0 stub)",
+      "setup": "",
+      "run": "python3 .github/tests/test_folkrace.py front",
+      "input": "",
+      "output": "",
+      "comparison": "included",
+      "timeout": 10,
+      "points": 15
+    },
+    {
+      "name": "Vasaku ja parema lidari lugemine implementeeritud",
+      "setup": "",
+      "run": "python3 .github/tests/test_folkrace.py leftright",
+      "input": "",
+      "output": "",
+      "comparison": "included",
+      "timeout": 10,
+      "points": 10
+    },
+    {
+      "name": "Reaktiivne loogika olemas (linear.x ja angular.z aktiivses koodis)",
+      "setup": "",
+      "run": "python3 .github/tests/test_folkrace.py reactive",
+      "input": "",
+      "output": "",
+      "comparison": "included",
+      "timeout": 10,
+      "points": 15
+    },
+    {
+      "name": "Tingimuse loogika olemas (takistuse valtimine)",
+      "setup": "",
+      "run": "python3 .github/tests/test_folkrace.py condition",
+      "input": "",
+      "output": "",
+      "comparison": "included",
+      "timeout": 10,
+      "points": 10
+    },
+    {
+      "name": "package.xml ja setup.py on korras",
+      "setup": "",
+      "run": "python3 -c \"import glob, sys; px=glob.glob('**/package.xml', recursive=True); sp=glob.glob('**/setup.py', recursive=True); px=[f for f in px if not f.startswith('.github')]; sp=[f for f in sp if not f.startswith('.github')]; sys.exit(0 if px and sp else 1)\"",
+      "input": "",
+      "output": "",
+      "comparison": "included",
+      "timeout": 5,
+      "points": 5
+    },
+    {
+      "name": "Kood ei sisalda lahendamata TODO-sid pealoogikas",
+      "setup": "",
+      "run": "python3 .github/tests/test_folkrace.py todos",
+      "input": "",
+      "output": "",
+      "comparison": "included",
+      "timeout": 10,
+      "points": 10
+    }
+  ]
+}

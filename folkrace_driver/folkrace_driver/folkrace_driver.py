@@ -1,282 +1,321 @@
+import math
+import signal
+import statistics
+import time
+
 import rclpy
+from geometry_msgs.msg import Twist
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
-from geometry_msgs.msg import Twist
 from std_msgs.msg import String
-import math, time, signal, statistics
 
-SOIDUKIIRUS  = 0.18 * 2
-POORDEKIIRUS = 4.0 / 5.0
+DRIVING_SPEED = 0.18 * 2
+TURN_SPEED    = 4.0 / 5.0
 
-OHUPIIR_ETTE = 1.10 / 2
-OHUPIIR_KULG = 3.0 / 10.0
+DANGER_LIMIT_FRONT = 1.10 / 2
+DANGER_LIMIT_SIDE  = 3.0 / 10.0
 
-TAGURDA_PIIR   = 1.0 / 4.0
-TAGURDA_KIIRUS = -(3.0 / 20.0)
-ROOMA_KIIRUS   = 6.0 / 50.0
-SEKTOREID      = 3 * 6
+REVERSE_THRESHOLD = 1.0 / 4.0
+REVERSE_SPEED     = -(3.0 / 20.0)
+CREEP_SPEED       = 6.0 / 50.0
 
-TAGURDA_PUSIVUS = 2 + 2
-LAHE_PUSIVUS    = 1 + 2
+SECTORS_COUNT      = 3 * 6
+REVERSE_PERSISTENCE = 2 + 2
+CLOSE_PERSISTENCE   = 1 + 2
 
-ROBOT_POOL_LAIUS = 15.0 / 100.0
-DISPARITY_LAVI   = 0.15 * 2
+ROBOT_HALF_WIDTH       = 15.0 / 100.0
+DISPARITY_THRESHOLD    = 0.15 * 2
+WHEEL_RADIUS           = 33.0 / 1000.0
+HALF_TRACK             = 83.0 / 1000.0
+MAX_WHEEL_ANGULAR_SPEED = 22.0 / 2.0
 
-RATTA_RAADIUS = 33.0 / 1000.0
-POOL_ROOPME   = 83.0 / 1000.0
+LIDAR_MIN_RANGE  = 0.12
+LIDAR_MAX_RANGE  = 8.0
+SCAN_TOPIC       = '/scan'
+CMD_VEL_TOPIC    = '/cmd_vel'
+STATE_TOPIC      = '/folkrace_state'
+LOG_INTERVAL     = 32
 
-MAX_RATTA_RAD_S = 22.0 / 2.0
+def _valid_range(r: float) -> bool:
+    return (
+        not math.isnan(r)
+        and not math.isinf(r)
+        and LIDAR_MIN_RANGE <= r <= LIDAR_MAX_RANGE
+    )
 
-# === AUTOGRADER SAFETY OVERRIDE ===
-DANGER_LIMIT_FRONT = 0.25
-REVERSE_SPEED = TAGURDA_KIIRUS
-TURN_SPEED = POORDEKIIRUS
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
 
+class FolkraceDriver(Node):
 
-class FolkraceJuht(Node):
     def __init__(self):
-        super().__init__('folkrace_juht')
-        self.create_subscription(LaserScan, '/scan', self._scan_cb, 10)
-        self._vel_pub  = self.create_publisher(Twist, '/cmd_vel', 10)
-        self._olek_pub = self.create_publisher(String, '/folkrace_olek', 10)
+        super().__init__('folkrace_driver')
+        self._setup_comms()
+        self._reset_state()
+        self.get_logger().info('FolkraceDriver started')
 
-        self._eelmine_nurk   = 0.0
-        self._log_counter    = 0
-        self._tagurda_streak = 0
-        self._lahe_streak    = 0
+    def _setup_comms(self):
+        self.create_subscription(LaserScan, SCAN_TOPIC, self._scan_callback, 10)
+        self._vel_pub   = self.create_publisher(Twist,  CMD_VEL_TOPIC, 10)
+        self._state_pub = self.create_publisher(String, STATE_TOPIC,   10)
 
-        self.get_logger().info('FolkraceJuht kaivitatud')
+    def _reset_state(self):
+        self._previous_angle  = 0.0
+        self._log_counter     = 0
+        self._reverse_streak  = 0
+        self._close_streak    = 0
 
-    def _olek(self, tekst: str):
-        self._olek_pub.publish(String(data=tekst))
+    def _publish_state(self, text: str):
+        self._state_pub.publish(String(data=text))
 
-    def _sektori_min(self, ranges, algus_kraad: float, lopp_kraad: float) -> float:
+    def _publish_cmd(self, speed: float, turn: float):
+        cmd = Twist()
+        cmd.linear.x  = float(_clamp(speed, -DRIVING_SPEED, DRIVING_SPEED))
+        cmd.angular.z = float(_clamp(turn,  -2.0,           2.0))
+        self._vel_pub.publish(cmd)
+
+    def _log_scan(self, front: float, left: float, right: float,
+                  speed: float, turn: float):
+        self._log_counter += 1
+        if self._log_counter % LOG_INTERVAL == 0:
+            self.get_logger().info(
+                f'front={front:.2f}m  left={left:.2f}m  right={right:.2f}m  '
+                f'→ v={speed:.2f}m/s  ω={turn:.2f}rad/s'
+            )
+
+    def _deg_to_index(self, deg: float, n: int) -> int:
+        return int((deg + 180.0) / 360.0 * n) % n
+
+    def _get_sector_min(self, ranges: list, start_deg: float,
+                        end_deg: float) -> float:
         n = len(ranges)
         if n == 0:
             return float('inf')
 
-        def kraad_indeks(k: float) -> int:
-            return int((k + 180.0) / 360.0 * n) % n
+        a = self._deg_to_index(start_deg, n)
+        b = self._deg_to_index(end_deg,   n)
 
-        a = kraad_indeks(algus_kraad)
-        b = kraad_indeks(lopp_kraad)
+        sector = ranges[a:b + 1] if a <= b else list(ranges[a:]) + list(ranges[:b + 1])
+        valid   = [r for r in sector if _valid_range(r)]
+        return statistics.median(valid) if valid else float('inf')
 
-        if a <= b:
-            sektor = ranges[a:b + 1]
-        else:
-            sektor = list(ranges[a:]) + list(ranges[:b + 1])
-
-        kehtivad = [r for r in sektor
-                    if not math.isnan(r) and not math.isinf(r)
-                    and 0.12 <= r <= 8.0]
-
-        return statistics.median(kehtivad) if kehtivad else float('inf')
-
-    def _laienda_disparities(self, kaugused):
-        n = len(kaugused)
-        sektor_rad = math.radians(180.0 / n)
-        inflated = list(kaugused)
+    def _inflate_disparities(self, distances: list) -> list:
+        n          = len(distances)
+        sector_rad = math.radians(180.0 / n)
+        inflated   = list(distances)
 
         for i in range(n - 1):
-            d_l = kaugused[i]
-            d_r = kaugused[i + 1]
-            erinevus = abs(d_l - d_r)
+            d_left  = distances[i]
+            d_right = distances[i + 1]
 
-            if erinevus < DISPARITY_LAVI:
+            if abs(d_left - d_right) < DISPARITY_THRESHOLD:
                 continue
 
-            if d_l < d_r:
-                d = d_l
+            if d_left < d_right:
+                self._inflate_towards_right(inflated, distances, i, d_left, sector_rad)
             else:
-                d = d_r
-
-            if d < 0.15:
-                continue
-
-            pool_nurk = math.asin(min(1.0, ROBOT_POOL_LAIUS / d))
-            laiendus = int(pool_nurk / sektor_rad) + 1
-
-            if d_l < d_r:
-                for k in range(i + 1, min(i + 1 + laiendus, n)):
-                    if inflated[k] > d:
-                        inflated[k] = d
-            else:
-                for k in range(max(0, i + 1 - laiendus), i + 1):
-                    if inflated[k] > d:
-                        inflated[k] = d
+                self._inflate_towards_left(inflated, distances, i, d_right, sector_rad)
 
         return inflated
 
-    def _kinemaatiline_limit(self, kiirus: float, poore: float):
-        valjund = (abs(kiirus) + abs(poore) * POOL_ROOPME) / RATTA_RAADIUS
-        if valjund > MAX_RATTA_RAD_S:
-            skaala = MAX_RATTA_RAD_S / valjund
-            kiirus *= skaala
-            poore *= skaala
-        return kiirus, poore
+    def _inflation_steps(self, d: float, sector_rad: float) -> int:
+        half_angle = math.asin(min(1.0, ROBOT_HALF_WIDTH / d))
+        return int(half_angle / sector_rad) + 1
 
-    def _scan_cb(self, msg: LaserScan):
+    def _inflate_towards_right(self, inflated: list, distances: list,
+                                i: int, d: float, sector_rad: float):
+        if d < 0.15:
+            return
+        n       = len(distances)
+        steps   = self._inflation_steps(d, sector_rad)
+        for k in range(i + 1, min(i + 1 + steps, n)):
+            if inflated[k] > d:
+                inflated[k] = d
+
+    def _inflate_towards_left(self, inflated: list, distances: list,
+                               i: int, d: float, sector_rad: float):
+        if d < 0.15:
+            return
+        steps = self._inflation_steps(d, sector_rad)
+        for k in range(max(0, i + 1 - steps), i + 1):
+            if inflated[k] > d:
+                inflated[k] = d
+
+    def _kinematic_limit(self, speed: float, turn: float):
+        output      = (abs(speed) + abs(turn) * HALF_TRACK) / WHEEL_RADIUS
+        if output > MAX_WHEEL_ANGULAR_SPEED:
+            scale   = MAX_WHEEL_ANGULAR_SPEED / output
+            speed  *= scale
+            turn   *= scale
+        return speed, turn
+
+    def _scan_callback(self, msg: LaserScan):
         ranges = list(msg.ranges)
 
-        ette  = self._sektori_min(ranges, -20, 20)
-        vasak = self._sektori_min(ranges, 60, 120)
-        parem = self._sektori_min(ranges, -120, -60)
+        front = self._get_sector_min(ranges,  -20,   20)
+        left  = self._get_sector_min(ranges,   60,  120)
+        right = self._get_sector_min(ranges, -120,  -60)
 
-        kiirus, poore = self._arvuta_kiirus(ranges, ette, vasak, parem)
-        kiirus, poore = self._kinemaatiline_limit(kiirus, poore)
+        speed, turn = self._calculate_speed(ranges, front, left, right)
+        speed, turn = self._kinematic_limit(speed, turn)
 
-        cmd = Twist()
-        cmd.linear.x  = float(max(-SOIDUKIIRUS, min(SOIDUKIIRUS, kiirus)))
-        cmd.angular.z = float(max(-2.0, min(2.0, poore)))
-        self._vel_pub.publish(cmd)
+        self._publish_cmd(speed, turn)
+        self._log_scan(front, left, right, speed, turn)
 
-        self._log_counter += 1
-        if self._log_counter % 32 == 0:
-            self.get_logger().info(
-                f'ette={ette:.2f} vasak={vasak:.2f} parem={parem:.2f} '
-                f'v={kiirus:.2f} o={poore:.2f}'
-            )
-
-    def _arvuta_kiirus(self, ranges, ette, vasak, parem):
+    def _calculate_speed(self, ranges: list, front: float,
+                         left: float, right: float):
         n = len(ranges)
         if n == 0:
-            return SOIDUKIIRUS, 0.0
+            return DRIVING_SPEED, 0.0
 
-        # === EMERGENCY AUTOGRADER OVERRIDE ===
-        if ette < DANGER_LIMIT_FRONT:
-            self._olek("OBSTACLE AHEAD")
+        self._update_reverse_streak(front)
 
-            suund = 1.0 if parem > vasak else -1.0
-            return REVERSE_SPEED, suund * TURN_SPEED
+        distances = self._build_sector_distances(ranges, n)
+        if distances is None:
+            return DRIVING_SPEED, 0.0
 
-        # streak tracking
-        if ette < TAGURDA_PIIR:
-            self._tagurda_streak += 1
+        distances = self._inflate_disparities(distances)
+
+        best_idx, best_distance = self._find_best_sector(distances)
+        self._update_close_streak(best_distance)
+
+        best_angle = self._sector_to_angle(best_idx)
+        best_angle = self._apply_angle_hysteresis(best_angle, best_distance, distances)
+        self._previous_angle = best_angle
+
+        return self._decide_motion(best_angle, best_distance, left, right)
+
+    def _update_reverse_streak(self, front: float):
+        if front < REVERSE_THRESHOLD:
+            self._reverse_streak += 1
         else:
-            self._tagurda_streak = 0
+            self._reverse_streak = 0
 
-        algus = n // 4
-        lopp  = 3 * n // 4
-        ette_ranges = ranges[algus:lopp]
+    def _update_close_streak(self, best_distance: float):
+        if best_distance < 0.4:
+            self._close_streak += 1
+        else:
+            self._close_streak = 0
 
-        m = len(ette_ranges)
-        sektor_suurus = m // SEKTOREID
-        if sektor_suurus == 0:
-            return SOIDUKIIRUS, 0.0
+    def _build_sector_distances(self, ranges: list, n: int):
+        start = n // 4
+        end   = 3 * n // 4
+        front_ranges = ranges[start:end]
+        m = len(front_ranges)
 
-        kaugused = []
-        for i in range(SEKTOREID):
-            a = i * sektor_suurus
-            b = a + sektor_suurus
-            sektor = ette_ranges[a:b]
+        sector_size = m // SECTORS_COUNT
+        if sector_size == 0:
+            return None
 
-            kehtivad = [r for r in sektor
-                        if not (math.isinf(r) or math.isnan(r)) and r > 0.12]
+        distances = []
+        for i in range(SECTORS_COUNT):
+            a      = i * sector_size
+            b      = a + sector_size
+            sector = front_ranges[a:b]
+            valid  = [r for r in sector if not (math.isinf(r) or math.isnan(r)) and r > LIDAR_MIN_RANGE]
+            distances.append(statistics.median(valid) if valid else LIDAR_MAX_RANGE)
+        return distances
 
-            kaugus = statistics.median(kehtivad) if kehtivad else float('inf')
-            kaugused.append(kaugus)
+    def _find_best_sector(self, distances: list):
+        best_distance = 0.0
+        best_idx      = SECTORS_COUNT // 2
 
-        kaugused = self._laienda_disparities(kaugused)
-
-        parim_kaugus = 0.0
-        parim_idx = SEKTOREID // 2
-
-        for i in range(SEKTOREID):
-            naaber_v = kaugused[i - 1] if i > 0 else kaugused[i]
-            naaber_p = kaugused[i + 1] if i < SEKTOREID - 1 else kaugused[i]
-
-            if naaber_v < 0.25 and naaber_p < 0.25:
+        for i in range(SECTORS_COUNT):
+            nb_left  = distances[i - 1] if i > 0               else distances[i]
+            nb_right = distances[i + 1] if i < SECTORS_COUNT - 1 else distances[i]
+            if nb_left < 0.25 and nb_right < 0.25:
                 continue
+            if distances[i] > best_distance:
+                best_distance = distances[i]
+                best_idx      = i
 
-            if kaugused[i] > parim_kaugus:
-                parim_kaugus = kaugused[i]
-                parim_idx = i
+        if best_distance == 0.0:
+            best_idx      = max(range(SECTORS_COUNT), key=lambda i: distances[i])
+            best_distance = distances[best_idx]
 
-        if parim_kaugus == 0.0:
-            parim_idx = max(range(SEKTOREID), key=lambda i: kaugused[i])
-            parim_kaugus = kaugused[parim_idx]
+        return best_idx, best_distance
 
-        if parim_kaugus < 0.4:
-            self._lahe_streak += 1
+    def _sector_to_angle(self, idx: int) -> float:
+        return -((idx / SECTORS_COUNT) - 0.5) * 180.0
+
+    def _apply_angle_hysteresis(self, best_angle: float,
+                                best_distance: float,
+                                distances: list) -> float:
+        previous_idx = int(((-self._previous_angle / 180.0) + 0.5) * SECTORS_COUNT)
+        previous_idx = _clamp(previous_idx, 0, SECTORS_COUNT - 1)
+        previous_distance = distances[int(previous_idx)]
+
+        if best_distance < previous_distance * 1.2 and previous_distance > 0.5:
+            return self._previous_angle
+        return best_angle
+
+    def _decide_motion(self, best_angle: float, best_distance: float,
+                       left: float, right: float):
+
+        if self._reverse_streak >= REVERSE_PERSISTENCE:
+            direction = 1.0 if best_angle >= 0 else -1.0
+            label     = 'L' if direction > 0 else 'R'
+            self._publish_state(f'REVERSING (persistent) → {label}')
+            return REVERSE_SPEED, direction * TURN_SPEED
+
+        angle_rad = math.radians(best_angle)
+        direction = 1.0 if best_angle >= 0 else -1.0
+
+        if self._close_streak >= CLOSE_PERSISTENCE and best_distance < 0.4:
+            label = 'L' if direction > 0 else 'R'
+            self._publish_state(f'STUCK → turning {label}')
+            speed = 0.0
+            turn  = direction * TURN_SPEED
+
+        elif best_distance < 0.4:
+            self._publish_state(f'CREEPING (temporary) → {best_angle:+.0f}°')
+            speed = CREEP_SPEED
+            turn  = direction * TURN_SPEED * 0.5
+
+        elif abs(best_angle) > 40:
+            speed = DRIVING_SPEED * 0.2
+            turn  = TURN_SPEED * 0.8 * direction
+
+        elif abs(best_angle) > 15:
+            speed = DRIVING_SPEED * 0.5
+            turn  = _clamp(angle_rad * 2.0, -TURN_SPEED, TURN_SPEED)
+
         else:
-            self._lahe_streak = 0
+            speed = DRIVING_SPEED
+            turn  = _clamp(angle_rad * 1.0, -TURN_SPEED * 0.3, TURN_SPEED * 0.3)
 
-        parim_nurk = ((parim_idx / SEKTOREID) - 0.5) * 180.0
-        parim_nurk = -parim_nurk
+        turn = self._apply_side_corrections(turn, left, right)
+        turn = _clamp(turn, -TURN_SPEED, TURN_SPEED)
 
-        eelmine_idx = int(((-self._eelmine_nurk / 180.0) + 0.5) * SEKTOREID)
-        eelmine_idx = max(0, min(SEKTOREID - 1, eelmine_idx))
-
-        eelmine_kaugus = kaugused[eelmine_idx]
-
-        if parim_kaugus < eelmine_kaugus * 1.2 and eelmine_kaugus > 0.5:
-            parim_nurk = self._eelmine_nurk
-
-        self._eelmine_nurk = parim_nurk
-
-        if self._tagurda_streak >= TAGURDA_PUSIVUS:
-            suund = 1.0 if parim_nurk >= 0 else -1.0
-            self._olek("TAGURDAN (pusiv)")
-            return TAGURDA_KIIRUS, suund * POORDEKIIRUS
-
-        nurk_rad = math.radians(parim_nurk)
-
-        if self._lahe_streak >= LAHE_PUSIVUS and parim_kaugus < 0.4:
-            suund = 1.0 if parim_nurk >= 0 else -1.0
-            self._olek("UMMIK -> pööre")
-            kiirus = 0.0
-            poore = suund * POORDEKIIRUS
-
-        elif parim_kaugus < 0.4:
-            self._olek("ROOMAN")
-            kiirus = ROOMA_KIIRUS
-            poore = (1.0 if parim_nurk >= 0 else -1.0) * POORDEKIIRUS * 0.5
-
-        elif abs(parim_nurk) > 40:
-            kiirus = SOIDUKIIRUS * 0.2
-            poore = POORDEKIIRUS * 0.8 * (1.0 if parim_nurk > 0 else -1.0)
-
-        elif abs(parim_nurk) > 15:
-            kiirus = SOIDUKIIRUS * 0.5
-            poore = nurk_rad * 2.0
-            poore = max(-POORDEKIIRUS, min(POORDEKIIRUS, poore))
-
-        else:
-            kiirus = SOIDUKIIRUS
-            poore = nurk_rad * 1.0
-            poore = max(-POORDEKIIRUS * 0.3, min(POORDEKIIRUS * 0.3, poore))
-
-        if vasak < OHUPIIR_KULG:
-            korr = (OHUPIIR_KULG - vasak) / OHUPIIR_KULG
-            poore -= korr * POORDEKIIRUS * 0.5
-
-        if parem < OHUPIIR_KULG:
-            korr = (OHUPIIR_KULG - parem) / OHUPIIR_KULG
-            poore += korr * POORDEKIIRUS * 0.5
-
-        poore = max(-POORDEKIIRUS, min(POORDEKIIRUS, poore))
-
-        self._olek(
-            f'PARIM={parim_nurk:+.0f} d={parim_kaugus:.1f} '
-            f'v={kiirus:.2f} o={poore:+.2f}'
+        self._publish_state(
+            f'BEST={best_angle:+.0f}° d={best_distance:.1f}m '
+            f'v={speed:.2f} ω={turn:+.2f}'
         )
+        return speed, turn
 
-        return kiirus, poore
+    def _apply_side_corrections(self, turn: float,
+                                left: float, right: float) -> float:
+        if left < DANGER_LIMIT_SIDE:
+            correction = (DANGER_LIMIT_SIDE - left) / DANGER_LIMIT_SIDE
+            turn -= correction * TURN_SPEED * 0.5
+        if right < DANGER_LIMIT_SIDE:
+            correction = (DANGER_LIMIT_SIDE - right) / DANGER_LIMIT_SIDE
+            turn += correction * TURN_SPEED * 0.5
+        return turn
 
+def _make_stop_handler(flag: list):
+    def _handler(sig, frame):
+        flag[0] = False
+    return _handler
 
 def main():
     rclpy.init()
-    node = FolkraceJuht()
+    node = FolkraceDriver()
 
-    running = True
+    running = [True]
+    signal.signal(signal.SIGINT, _make_stop_handler(running))
 
-    def _stop(sig, frame):
-        nonlocal running
-        running = False
-
-    signal.signal(signal.SIGINT, _stop)
-
-    while running:
+    while running[0]:
         rclpy.spin_once(node, timeout_sec=0.1)
 
     stop = Twist()
@@ -286,8 +325,7 @@ def main():
 
     node.destroy_node()
     rclpy.shutdown()
-    print("\nPeatatud.")
-
+    print('\nStopped.')
 
 if __name__ == '__main__':
     main()
